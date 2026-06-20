@@ -1,4 +1,4 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+                                      # Copyright 2024 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,9 +42,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-# xformers' memory_efficient_attention interacts badly with our cross-attention
-# mask path on torch 2.9 + xformers 0.0.33; fall back to PyTorch SDPA, which is
-# numerically equivalent here. Must be set before any sana imports.
+# xformers 的 memory_efficient_attention 在 torch 2.9 + xformers 0.0.33 环境下，
+# 会与我们 cross-attention 的 mask 路径冲突，导致兼容性问题。
+# 因此这里提前设置 DISABLE_XFORMERS=1，强制回退到 PyTorch SDPA（两者在这里数值等价）。
+# 这行代码必须在导入任何 sana 相关模块之前执行。
 os.environ.setdefault("DISABLE_XFORMERS", "1")
 
 import imageio.v3 as iio
@@ -54,7 +55,9 @@ import torch
 from PIL import Image
 from torchvision import transforms as T
 
-# Importing diffusion.model.nets registers all Sana / Sana-WM blocks.
+# diffusion.model 在 Sana 中主要负责扩散模型的搭建与核心推理模块的注册，
+# 用于生成视频的潜在表示（latent video）；
+# 换句话说，它实现了根据输入的图像、文本描述和相机轨迹，利用扩散过程生成高质量的视频序列这一核心功能。
 import diffusion.model.nets  # noqa: F401
 from diffusion import DPMS, FlowEuler, LTXFlowEuler
 from diffusion.model.builder import (
@@ -110,14 +113,24 @@ ALLOWED_ACTION_KEYS: frozenset[str] = frozenset("wasdijkl")
 class InferenceConfig:
     """Slim YAML config: model + VAE + text encoder + scheduler only."""
 
-    model: ModelVideoCamCtrlConfig
-    vae: AEConfig
-    text_encoder: TextEncoderConfig
-    scheduler: SchedulerConfig
-    # The base Sana class checks ``config.work_dir`` to decide where to tee
-    # initialization logs; an empty string means "log to stdout".
+    # 这是Python的类型注解（type annotation）语法，配合dataclasses库，用于定义数据结构（配置类）的字段和类型。
+    # 作用: 明确每个配置项的数据类型，方便类型检查、自动补全、文档生成，并有助于提升代码可读性和健壮性。
+    model: ModelVideoCamCtrlConfig       # 世界模型的主模型配置
+    vae: AEConfig                       # VAE（变分自编码器）配置
+    text_encoder: TextEncoderConfig     # 文本编码器配置
+    scheduler: SchedulerConfig          # 采样/扩散调度器配置
+    # base Sana 类会根据 config.work_dir 判断初始化日志写入路径；空字符串表示写到标准输出(stdout)。
     work_dir: str = ""
 
+
+# 这是 Python 3.7+ 的 @dataclass 装饰器，用于简化定义只包含数据字段的类（数据类）。
+# 它会自动为类生成 __init__、__repr__、__eq__ 等方法，让类像一个可比/可打印的“数据容器”。
+# 常见的 class 类型还有：
+# - 普通类：class MyClass: ...，不自动生成方法，完全手写；
+# - NamedTuple: 类似 dataclass，但不可变、基于元组；
+# - Enum：class MyEnum(enum.Enum): ...，用于定义一组常量（枚举值）；
+# - TypedDict: 指定字典 key 类型的特殊 class；
+# - ABC（抽象基类）：用于接口、需要子类实现的模板。
 
 @dataclass
 class GenerationParams:
