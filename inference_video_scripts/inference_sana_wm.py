@@ -35,6 +35,7 @@ propagate into the generated geometry.
 
 import argparse
 import gc
+import json
 import logging
 import math
 import os
@@ -656,7 +657,10 @@ class SanaWMPipeline:
             params: Per-call generation knobs.
 
         Returns:
-            Dict with ``video`` ``(T, H, W, 3)`` uint8, ``c2w``, and ``latent``.
+            Dict with ``video`` ``(T, H, W, 3)`` uint8, ``c2w``, the stage-1
+            ``latent``, plus ``decode_latent`` (the latent actually decoded to
+            ``video`` — refined latent when the refiner is on, else the stage-1
+            latent) and ``latent_kind`` describing which one it is.
         """
         vae_stride = self.config.vae.vae_stride
         latent_T = (params.num_frames - 1) // vae_stride[0] + 1
@@ -672,14 +676,27 @@ class SanaWMPipeline:
         sana_latent = self._sample_stage1(image, prompt, camera, params, latent_T, latent_h, latent_w)
 
         if self.refiner_settings is not None:
-            video = self._refine(sana_latent, prompt, params, self.refiner_settings)
+            video, refined_latent = self._refine(sana_latent, prompt, params, self.refiner_settings)
             # _refine drops the sink anchor frame; realign the trajectory.
             video_c2w = c2w[1 : params.num_frames]
+            # The refined latent is what actually decoded to ``video``.
+            decode_latent = refined_latent
+            latent_kind = "refined_ltx2"
         else:
             video = self._decode_with_sana_vae(sana_latent)
             video_c2w = c2w[: params.num_frames]
+            # With --no_refiner the stage-1 Sana latent is decoded directly, so it
+            # IS the latent that produced ``video`` (clean for latent concat).
+            decode_latent = sana_latent.detach().cpu()
+            latent_kind = "stage1_sana"
 
-        return {"video": video, "c2w": video_c2w, "latent": sana_latent.cpu()}
+        return {
+            "video": video,
+            "c2w": video_c2w,
+            "latent": sana_latent.detach().cpu(),
+            "decode_latent": decode_latent,
+            "latent_kind": latent_kind,
+        }
 
     # ------- stage 1: Sana DiT -------
 
@@ -852,7 +869,7 @@ class SanaWMPipeline:
         prompt: str,
         params: GenerationParams,
         refiner: RefinerSettings,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, torch.Tensor]:
         if self.offload_refiner:
             self._offload_stage1()
             self._build_refiner()
@@ -877,10 +894,11 @@ class SanaWMPipeline:
         # The refiner's first decoded frame is the clean sink anchor; drop it so
         # the output starts from the first refined frame.
         video = video[1:]
+        refined_latent = refined.detach().cpu()
         del refined
         torch.cuda.empty_cache()
         gc.collect()
-        return video
+        return video, refined_latent
 
 
 # ============================================================================
@@ -948,6 +966,37 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no_action_overlay",
         action="store_true",
         help="Skip rendering the WASD + joystick overlay on the output video.",
+    )
+
+    # Experiment outputs (all optional; default behaviour is unchanged). These let an
+    # external chunk-rollout orchestrator chain segments and re-decode concatenated
+    # latents. See scripts/12_sana_qwen_latent_chunk_rollout.py in the parent repo.
+    p.add_argument(
+        "--save_latent_path",
+        type=Path,
+        default=None,
+        help="Save the final latent actually used for decode as a torch .pt dict "
+        "(keys: latent + metadata). Refiner on -> refined latent; --no_refiner -> stage-1.",
+    )
+    p.add_argument(
+        "--save_latent_meta_path",
+        type=Path,
+        default=None,
+        help="Write a plain-JSON sidecar (shape/kind/dtype/stride/...) for the saved latent, "
+        "so a login-node orchestrator can read latent shapes without importing torch.",
+    )
+    p.add_argument(
+        "--save_last_frame_path",
+        type=Path,
+        default=None,
+        help="Save the clean (pre-overlay) last output frame as a PNG, for chunk continuation.",
+    )
+    p.add_argument(
+        "--save_intrinsics_path",
+        type=Path,
+        default=None,
+        help="Save the post-crop [fx,fy,cx,cy] frame-0 intrinsics as a (4,) .npy, so "
+        "subsequent chunks can reuse identical intrinsics instead of re-estimating with Pi3X.",
     )
 
     # Weights and config.
@@ -1087,6 +1136,47 @@ def main() -> None:
 
     out = pipeline.generate(cropped, prompt, c2w, intrinsics_vec4, params)
     video_hwc = out["video"]
+
+    # ---- optional experiment outputs (latent / last frame / intrinsics) ----
+    # Saved from the CLEAN video, before the action overlay is composited, so a
+    # fed-back last frame never carries the HUD into the next chunk.
+    if args.save_last_frame_path is not None:
+        args.save_last_frame_path.parent.mkdir(parents=True, exist_ok=True)
+        last_frame = np.asarray(out["video"][-1])
+        Image.fromarray(last_frame).save(args.save_last_frame_path)
+        logger.info(f"Saved clean last frame -> {args.save_last_frame_path}")
+
+    if args.save_intrinsics_path is not None:
+        args.save_intrinsics_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(args.save_intrinsics_path, intrinsics_vec4[0].astype(np.float32))
+        logger.info(f"Saved frame-0 intrinsics -> {args.save_intrinsics_path}")
+
+    decode_latent = out["decode_latent"]
+    latent_meta = {
+        "latent_kind": out["latent_kind"],
+        "shape": list(decode_latent.shape),
+        "dtype": str(decode_latent.dtype),
+        "vae_stride": list(config.vae.vae_stride),
+        "vae_type": config.vae.vae_type,
+        "num_frames": int(num_frames),
+        "fps": int(params.fps),
+        "seed": int(params.seed),
+        "no_refiner": bool(args.no_refiner),
+        "target_height": TARGET_HEIGHT,
+        "target_width": TARGET_WIDTH,
+    }
+    logger.info(
+        f"[latent] kind={latent_meta['latent_kind']} shape={tuple(decode_latent.shape)} "
+        f"dtype={decode_latent.dtype}"
+    )
+    if args.save_latent_path is not None:
+        args.save_latent_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"latent": decode_latent, **latent_meta}, args.save_latent_path)
+        logger.info(f"Saved decode latent -> {args.save_latent_path}")
+    if args.save_latent_meta_path is not None:
+        args.save_latent_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        args.save_latent_meta_path.write_text(json.dumps(latent_meta, indent=2), encoding="utf-8")
+        logger.info(f"Saved latent meta -> {args.save_latent_meta_path}")
 
     if not args.no_action_overlay:
         logger.info("Compositing action overlay onto the output video.")
