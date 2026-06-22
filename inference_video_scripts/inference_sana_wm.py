@@ -646,6 +646,8 @@ class SanaWMPipeline:
         c2w: np.ndarray,
         intrinsics_vec4: np.ndarray,
         params: GenerationParams = GenerationParams(),
+        prefix_latent: torch.Tensor | None = None,
+        freeze_prefix: bool = True,
     ) -> dict[str, object]:
         """Generate a video.
 
@@ -673,7 +675,10 @@ class SanaWMPipeline:
             vae_stride=vae_stride,
         )
 
-        sana_latent = self._sample_stage1(image, prompt, camera, params, latent_T, latent_h, latent_w)
+        sana_latent = self._sample_stage1(
+            image, prompt, camera, params, latent_T, latent_h, latent_w,
+            prefix_latent=prefix_latent, freeze_prefix=freeze_prefix,
+        )
 
         if self.refiner_settings is not None:
             video, refined_latent = self._refine(sana_latent, prompt, params, self.refiner_settings)
@@ -733,6 +738,8 @@ class SanaWMPipeline:
         latent_T: int,
         latent_h: int,
         latent_w: int,
+        prefix_latent: torch.Tensor | None = None,
+        freeze_prefix: bool = True,
     ) -> torch.Tensor:
         if self.offload_vae:
             self.vae.to(self.device)
@@ -769,13 +776,39 @@ class SanaWMPipeline:
             device=self.device,
             generator=generator,
         )
-        z[:, :, :1] = first_latent
+        # Latent-prefix continuation: place the frozen cumulative prefix into z[:, :, :T_prev]
+        # and mark those frames as clean conditioning so the sampler keeps them unchanged
+        # (LTXFlowEuler treats condition_frame_info frames as timestep-0 / non-denoised).
+        # This generalises the default single-frame (frame-0) image conditioning.
+        if prefix_latent is not None:
+            prefix = prefix_latent.to(self.device, dtype=self.weight_dtype)
+            prefix_T = int(prefix.shape[2])
+            if prefix_T >= latent_T:
+                raise ValueError(
+                    f"prefix latent T={prefix_T} must be < total latent_T={latent_T}; "
+                    f"increase --num_frames / --suffix_latent_frames."
+                )
+            if prefix.shape[1] != latent_channels or tuple(prefix.shape[3:]) != (latent_h, latent_w):
+                raise ValueError(
+                    f"prefix latent shape {tuple(prefix.shape)} incompatible with "
+                    f"(C={latent_channels}, H={latent_h}, W={latent_w})."
+                )
+            z[:, :, :prefix_T] = prefix
+            cond_frames = prefix_T if freeze_prefix else 1
+            self.logger.info(
+                f"[prefix] T_prev={prefix_T} suffix={latent_T - prefix_T} freeze={freeze_prefix} "
+                f"-> conditioning {cond_frames} clean frame(s)"
+            )
+        else:
+            z[:, :, :1] = first_latent
+            cond_frames = 1
+        condition_frame_info = {i: 0.0 for i in range(cond_frames)}
 
         chunk_index = get_chunk_index_from_config(self.config, num_frames=latent_T)
         model_kwargs: dict[str, object] = dict(
             data_info={
                 "img_hw": torch.tensor([[TARGET_HEIGHT, TARGET_WIDTH]], dtype=torch.float, device=self.device),
-                "condition_frame_info": {0: 0.0},
+                "condition_frame_info": condition_frame_info,
             },
             mask=mask_cfg,
             camera_conditions=raymap_cfg,
@@ -999,6 +1032,46 @@ def _build_parser() -> argparse.ArgumentParser:
         "subsequent chunks can reuse identical intrinsics instead of re-estimating with Pi3X.",
     )
 
+    # Latent-prefix continuation (Plan 2: experiment/latent-prefix-rollout). no_refiner only.
+    p.add_argument(
+        "--prefix_latent_path",
+        type=Path,
+        default=None,
+        help="Load a frozen cumulative latent prefix (.pt, shape (1,C,T_prev,H,W)) and only "
+        "generate the new suffix frames after it. stage1_sana latents only.",
+    )
+    p.add_argument(
+        "--freeze_prefix_latent",
+        action="store_true",
+        help="Keep ALL prefix latent frames as clean conditioning (frozen) during denoising. "
+        "Without it, only frame 0 is conditioned (default single-frame behaviour).",
+    )
+    p.add_argument(
+        "--suffix_latent_frames",
+        type=int,
+        default=6,
+        help="Number of NEW latent frames to generate after the prefix (informational; the "
+        "actual suffix = latent_T - T_prev is derived from --num_frames to keep camera aligned).",
+    )
+    p.add_argument("--prefix_latent_kind", default="stage1_sana", help="Expected kind of the prefix latent.")
+    p.add_argument(
+        "--save_cumulative_latent_path", type=Path, default=None,
+        help="Save the full cumulative latent (prefix + new suffix) as a .pt dict.",
+    )
+    p.add_argument(
+        "--save_suffix_latent_path", type=Path, default=None,
+        help="Save only the newly generated suffix latent frames as a .pt dict.",
+    )
+    p.add_argument(
+        "--save_cumulative_video_path", type=Path, default=None,
+        help="Decode the cumulative latent to the full cumulative video mp4.",
+    )
+    p.add_argument(
+        "--save_suffix_video_path", type=Path, default=None,
+        help="Save only the newly generated suffix region of the cumulative video (last "
+        "(latent_T - T_prev)*vae_stride frames), for VLM judging of the new chunk only.",
+    )
+
     # Weights and config.
     p.add_argument(
         "--config", default=HF_DEFAULTS["config"], help="Slim inference YAML config (local path or hf:// URI)."
@@ -1134,7 +1207,25 @@ def main() -> None:
         sampling_algo=args.sampling_algo,
     )
 
-    out = pipeline.generate(cropped, prompt, c2w, intrinsics_vec4, params)
+    # ---- latent-prefix continuation (Plan 2): load frozen prefix ----
+    prefix_latent = None
+    if args.prefix_latent_path is not None:
+        if not args.no_refiner:
+            raise SystemExit(
+                "Unsupported: --prefix_latent_path requires --no_refiner. The refined LTX-2 "
+                "latent is a different latent space and must not be used as a SANA-DiT prefix."
+            )
+        obj = torch.load(args.prefix_latent_path, map_location="cpu")
+        prefix_latent = obj["latent"] if isinstance(obj, dict) and "latent" in obj else obj
+        logger.info(
+            f"[prefix] loaded {tuple(prefix_latent.shape)} from {args.prefix_latent_path} "
+            f"(freeze={args.freeze_prefix_latent})"
+        )
+
+    out = pipeline.generate(
+        cropped, prompt, c2w, intrinsics_vec4, params,
+        prefix_latent=prefix_latent, freeze_prefix=args.freeze_prefix_latent,
+    )
     video_hwc = out["video"]
 
     # ---- optional experiment outputs (latent / last frame / intrinsics) ----
@@ -1165,6 +1256,17 @@ def main() -> None:
         "target_height": TARGET_HEIGHT,
         "target_width": TARGET_WIDTH,
     }
+    if prefix_latent is not None:
+        pT = int(prefix_latent.shape[2])
+        latent_meta["prefix_T"] = pT
+        latent_meta["frozen_prefix"] = bool(args.freeze_prefix_latent)
+        latent_meta["prefix_max_abs_diff"] = float(
+            (out["latent"][:, :, :pT].float() - prefix_latent.float()).abs().max().item()
+        )
+        logger.info(
+            f"[prefix] freeze check: max_abs_diff(prefix_in, cumulative_out[:{pT}]) = "
+            f"{latent_meta['prefix_max_abs_diff']:.3e}"
+        )
     logger.info(
         f"[latent] kind={latent_meta['latent_kind']} shape={tuple(decode_latent.shape)} "
         f"dtype={decode_latent.dtype}"
@@ -1177,6 +1279,35 @@ def main() -> None:
         args.save_latent_meta_path.parent.mkdir(parents=True, exist_ok=True)
         args.save_latent_meta_path.write_text(json.dumps(latent_meta, indent=2), encoding="utf-8")
         logger.info(f"Saved latent meta -> {args.save_latent_meta_path}")
+
+    # ---- latent-prefix continuation outputs ----
+    # out["latent"] is the FULL cumulative stage-1 latent (prefix + new suffix); the decoded
+    # out["video"] is the corresponding cumulative video (clean, pre-overlay).
+    if args.save_cumulative_latent_path is not None or args.save_suffix_latent_path is not None or args.save_cumulative_video_path is not None:
+        cumulative_latent = out["latent"]
+        prefix_T_saved = int(prefix_latent.shape[2]) if prefix_latent is not None else 1
+        suffix_latent = cumulative_latent[:, :, prefix_T_saved:]
+        cum_meta = {**latent_meta, "shape": list(cumulative_latent.shape),
+                    "prefix_T": prefix_T_saved, "suffix_T": int(cumulative_latent.shape[2] - prefix_T_saved),
+                    "prefix_latent_kind": args.prefix_latent_kind, "frozen_prefix": bool(args.freeze_prefix_latent)}
+        if args.save_cumulative_latent_path is not None:
+            args.save_cumulative_latent_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"latent": cumulative_latent, **cum_meta}, args.save_cumulative_latent_path)
+            logger.info(f"Saved cumulative latent {tuple(cumulative_latent.shape)} -> {args.save_cumulative_latent_path}")
+        if args.save_suffix_latent_path is not None:
+            args.save_suffix_latent_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"latent": suffix_latent, **cum_meta}, args.save_suffix_latent_path)
+            logger.info(f"Saved suffix latent {tuple(suffix_latent.shape)} -> {args.save_suffix_latent_path}")
+        if args.save_cumulative_video_path is not None:
+            args.save_cumulative_video_path.parent.mkdir(parents=True, exist_ok=True)
+            iio.imwrite(args.save_cumulative_video_path, np.asarray(out["video"]), fps=params.fps)
+            logger.info(f"Saved cumulative video ({out['video'].shape[0]} frames) -> {args.save_cumulative_video_path}")
+        if args.save_suffix_video_path is not None:
+            args.save_suffix_video_path.parent.mkdir(parents=True, exist_ok=True)
+            suffix_pixels = max(1, int(cumulative_latent.shape[2] - prefix_T_saved) * int(config.vae.vae_stride[0]))
+            suffix_video = np.asarray(out["video"])[-suffix_pixels:]
+            iio.imwrite(args.save_suffix_video_path, suffix_video, fps=params.fps)
+            logger.info(f"Saved suffix video ({suffix_video.shape[0]} frames) -> {args.save_suffix_video_path}")
 
     if not args.no_action_overlay:
         logger.info("Compositing action overlay onto the output video.")
