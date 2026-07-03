@@ -1,0 +1,5 @@
+A low third-person tracking shot from just behind the same miniature red race car on a cracked wooden plank path inside the same cluttered, sunlit toy room. The room contains scattered glass marbles, colorful wooden blocks, buttons, books, table legs, dusty furniture, and warm bands of afternoon sunlight.
+
+A single blue glass marble sits directly on the plank path a short distance ahead of the red car. During this short six-second clip, the red car rolls forward and performs one clear first interaction: it gently nudges the blue marble, causing the marble to roll a small visible distance to the right while the car remains stable and continues slowly.
+
+Keep the same room layout, the same red race car identity, the same cracked wooden floor, and the same warm lighting. The interaction should be small, local, and physically plausible. Avoid object teleportation, penetration through solid objects, sudden scene changes, extra cars, melting shapes, unstable car geometry, or large unrealistic impacts.
