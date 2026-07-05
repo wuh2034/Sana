@@ -1,0 +1,5 @@
+A low third-person tracking shot from just behind the same miniature red race car on a cracked wooden plank path inside the same cluttered, sunlit toy room. The room contains scattered glass marbles, colorful wooden blocks, buttons, books, table legs, dusty furniture, and warm bands of afternoon sunlight.
+
+A small transparent blue glass ball sits directly in front of the red race car on the wooden plank path. During this short six-second clip, the red race car moves forward only a little and performs one clear first interaction: it gently bumps the transparent blue ball, causing the ball to roll a small visible distance forward or slightly to the side while the car remains stable.
+
+The collision should be light, local, and physically plausible. The blue ball should not teleport, disappear, melt, or pass through the car. The red race car should keep its shape, identity, wheels, and stable motion. Keep the same toy room layout, the same wooden floor, the same warm sunlight, and the same surrounding objects. Avoid sudden scene changes, extra cars, object identity drift, camera jumps, penetration through solid objects, or unrealistic large impacts.

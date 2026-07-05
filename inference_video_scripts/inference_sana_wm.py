@@ -60,7 +60,7 @@ from torchvision import transforms as T
 # 用于生成视频的潜在表示（latent video）；
 # 换句话说，它实现了根据输入的图像、文本描述和相机轨迹，利用扩散过程生成高质量的视频序列这一核心功能。
 import diffusion.model.nets  # noqa: F401
-from diffusion import DPMS, FlowEuler, LTXFlowEuler
+from diffusion import DPMS, FlowEuler, LTXFlowEuler, PrefixHardmaskLTXFlowEuler
 from diffusion.model.builder import (
     build_model,
     get_tokenizer_and_text_encoder,
@@ -648,6 +648,8 @@ class SanaWMPipeline:
         params: GenerationParams = GenerationParams(),
         prefix_latent: torch.Tensor | None = None,
         freeze_prefix: bool = True,
+        prefix_hardmask: bool = False,
+        hardmask_fixed_noise: bool = True,
     ) -> dict[str, object]:
         """Generate a video.
 
@@ -678,6 +680,7 @@ class SanaWMPipeline:
         sana_latent = self._sample_stage1(
             image, prompt, camera, params, latent_T, latent_h, latent_w,
             prefix_latent=prefix_latent, freeze_prefix=freeze_prefix,
+            prefix_hardmask=prefix_hardmask, hardmask_fixed_noise=hardmask_fixed_noise,
         )
 
         if self.refiner_settings is not None:
@@ -740,6 +743,8 @@ class SanaWMPipeline:
         latent_w: int,
         prefix_latent: torch.Tensor | None = None,
         freeze_prefix: bool = True,
+        prefix_hardmask: bool = False,
+        hardmask_fixed_noise: bool = True,
     ) -> torch.Tensor:
         if self.offload_vae:
             self.vae.to(self.device)
@@ -776,10 +781,21 @@ class SanaWMPipeline:
             device=self.device,
             generator=generator,
         )
-        # Latent-prefix continuation: place the frozen cumulative prefix into z[:, :, :T_prev]
-        # and mark those frames as clean conditioning so the sampler keeps them unchanged
-        # (LTXFlowEuler treats condition_frame_info frames as timestep-0 / non-denoised).
-        # This generalises the default single-frame (frame-0) image conditioning.
+        # Latent-prefix continuation. Two mutually exclusive modes:
+        #
+        # (a) freeze_prefix / condition_frame_info (default, Plan 2): place the CLEAN
+        #     prefix into z[:, :, :T_prev] and mark those frames as clean conditioning;
+        #     LTXFlowEuler gives them per-frame timestep 0 and never denoises them
+        #     (model sees [clean prefix | noisy future]).
+        #
+        # (b) prefix_hardmask (LDM-inpainting style): z stays PURE NOISE everywhere;
+        #     PrefixHardmaskLTXFlowEuler forward-noises the clean prefix to the CURRENT
+        #     sigma_t at EVERY step and hard-replaces the prefix region, so the model
+        #     sees the whole cumulative latent at ONE uniform noise level. No
+        #     condition_frame_info at all — the anchor frame 0 is inside the prefix.
+        hardmask_x0_known: torch.Tensor | None = None
+        hardmask_prefix_mask: torch.Tensor | None = None
+        self.last_hardmask_debug = None
         if prefix_latent is not None:
             prefix = prefix_latent.to(self.device, dtype=self.weight_dtype)
             prefix_T = int(prefix.shape[2])
@@ -793,12 +809,45 @@ class SanaWMPipeline:
                     f"prefix latent shape {tuple(prefix.shape)} incompatible with "
                     f"(C={latent_channels}, H={latent_h}, W={latent_w})."
                 )
-            z[:, :, :prefix_T] = prefix
-            cond_frames = prefix_T if freeze_prefix else 1
-            self.logger.info(
-                f"[prefix] T_prev={prefix_T} suffix={latent_T - prefix_T} freeze={freeze_prefix} "
-                f"-> conditioning {cond_frames} clean frame(s)"
-            )
+            if prefix_hardmask:
+                # x0_known: clean prefix in the prefix region, zeros (unused) elsewhere.
+                hardmask_x0_known = torch.zeros_like(z)
+                hardmask_x0_known[:, :, :prefix_T] = prefix
+                # Temporal mask [B,1,T,1,1]: 1 = known prefix, 0 = region to generate.
+                hardmask_prefix_mask = torch.zeros(
+                    1, 1, latent_T, 1, 1, dtype=self.weight_dtype, device=self.device
+                )
+                hardmask_prefix_mask[:, :, :prefix_T] = 1.0
+                cond_frames = 0
+                self.last_hardmask_debug = {
+                    "mask_shape": list(hardmask_prefix_mask.shape),
+                    "x0_known_shape": list(hardmask_x0_known.shape),
+                    "cumulative_latent_shape": list(z.shape),
+                    "prefix_T": prefix_T,
+                    "new_T": latent_T - prefix_T,
+                    "used_noise_schedule": (
+                        "FlowMatchEulerDiscreteScheduler (rectified flow): "
+                        "known_t = (1 - sigma_t) * known_clean + sigma_t * noise, "
+                        "sigma_t = timesteps[i]/1000 (flow_shift folded in by set_timesteps); "
+                        "NOT DDPM sqrt(alpha_bar) form"
+                    ),
+                    "fixed_noise_for_prefix": bool(hardmask_fixed_noise),
+                    "per_step_replacement": True,
+                    "final_replacement": True,
+                    "condition_frame_info": "none (anchor frame 0 enforced via hardmask prefix)",
+                }
+                self.logger.info(
+                    f"[hardmask] T_prev={prefix_T} new={latent_T - prefix_T} "
+                    f"fixed_noise={hardmask_fixed_noise} -> per-step noised-prefix hard replacement, "
+                    f"0 condition frames, uniform timestep for all frames"
+                )
+            else:
+                z[:, :, :prefix_T] = prefix
+                cond_frames = prefix_T if freeze_prefix else 1
+                self.logger.info(
+                    f"[prefix] T_prev={prefix_T} suffix={latent_T - prefix_T} freeze={freeze_prefix} "
+                    f"-> conditioning {cond_frames} clean frame(s)"
+                )
         else:
             z[:, :, :1] = first_latent
             cond_frames = 1
@@ -818,18 +867,37 @@ class SanaWMPipeline:
             model_kwargs["chunk_index"] = chunk_index
 
         flow_shift = self._resolve_flow_shift(params.flow_shift)
-        samples = self._dispatch_solver(
-            params.sampling_algo,
-            z,
-            cond,
-            neg,
-            params.cfg_scale,
-            flow_shift,
-            params.step,
-            model_kwargs,
-            chunk_index,
-            generator,
-        )
+        if hardmask_x0_known is not None:
+            # LDM-inpainting-style sampling-time hard mask replacement (flow-matching
+            # schedule; see PrefixHardmaskLTXFlowEuler docstring).
+            samples = PrefixHardmaskLTXFlowEuler(
+                self.model,
+                condition=cond,
+                uncondition=neg,
+                cfg_scale=params.cfg_scale,
+                flow_shift=flow_shift,
+                model_kwargs=model_kwargs,
+            ).sample(
+                z,
+                steps=params.step,
+                generator=generator,
+                x0_known=hardmask_x0_known,
+                prefix_mask=hardmask_prefix_mask,
+                fixed_noise=hardmask_fixed_noise,
+            )
+        else:
+            samples = self._dispatch_solver(
+                params.sampling_algo,
+                z,
+                cond,
+                neg,
+                params.cfg_scale,
+                flow_shift,
+                params.step,
+                model_kwargs,
+                chunk_index,
+                generator,
+            )
         torch.cuda.empty_cache()
         return samples.detach()
 
@@ -1053,6 +1121,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Number of NEW latent frames to generate after the prefix (informational; the "
         "actual suffix = latent_T - T_prev is derived from --num_frames to keep camera aligned).",
     )
+    p.add_argument(
+        "--prefix_hardmask_inpaint",
+        action="store_true",
+        help="LDM-inpainting-style temporal prefix locking: at EVERY denoising step, "
+        "forward-noise the clean prefix latent to the CURRENT sigma_t (flow-matching "
+        "interpolation known_t = (1-sigma_t)*x0 + sigma_t*noise) and hard-replace the "
+        "prefix region of x_t, so the model always sees ONE uniform noise level. "
+        "Requires --prefix_latent_path + --no_refiner; mutually exclusive with "
+        "--freeze_prefix_latent (which is the clean-prefix/timestep-0 conditioning path).",
+    )
+    p.add_argument(
+        "--hardmask_noise_mode",
+        choices=["fixed", "per_step"],
+        default="fixed",
+        help="Noise used to forward-noise the known prefix each step: 'fixed' = one noise "
+        "sample reused every step (the rectified-flow straight-line path), 'per_step' = "
+        "fresh noise each step (literal LDM q_sample behaviour).",
+    )
     p.add_argument("--prefix_latent_kind", default="stage1_sana", help="Expected kind of the prefix latent.")
     p.add_argument(
         "--save_cumulative_latent_path", type=Path, default=None,
@@ -1209,6 +1295,17 @@ def main() -> None:
 
     # ---- latent-prefix continuation (Plan 2): load frozen prefix ----
     prefix_latent = None
+    if args.prefix_hardmask_inpaint:
+        if args.prefix_latent_path is None:
+            raise SystemExit("--prefix_hardmask_inpaint requires --prefix_latent_path.")
+        if args.freeze_prefix_latent:
+            raise SystemExit(
+                "--prefix_hardmask_inpaint and --freeze_prefix_latent are mutually exclusive: "
+                "hardmask replaces the noised prefix every step; freeze keeps it clean at "
+                "timestep 0. Pick one."
+            )
+        if args.sampling_algo != "flow_euler_ltx":
+            raise SystemExit("--prefix_hardmask_inpaint currently supports --sampling_algo flow_euler_ltx only.")
     if args.prefix_latent_path is not None:
         if not args.no_refiner:
             raise SystemExit(
@@ -1219,12 +1316,14 @@ def main() -> None:
         prefix_latent = obj["latent"] if isinstance(obj, dict) and "latent" in obj else obj
         logger.info(
             f"[prefix] loaded {tuple(prefix_latent.shape)} from {args.prefix_latent_path} "
-            f"(freeze={args.freeze_prefix_latent})"
+            f"(freeze={args.freeze_prefix_latent}, hardmask={args.prefix_hardmask_inpaint})"
         )
 
     out = pipeline.generate(
         cropped, prompt, c2w, intrinsics_vec4, params,
         prefix_latent=prefix_latent, freeze_prefix=args.freeze_prefix_latent,
+        prefix_hardmask=args.prefix_hardmask_inpaint,
+        hardmask_fixed_noise=(args.hardmask_noise_mode == "fixed"),
     )
     video_hwc = out["video"]
 
@@ -1258,15 +1357,19 @@ def main() -> None:
     }
     if prefix_latent is not None:
         pT = int(prefix_latent.shape[2])
+        prefix_diff = (out["latent"][:, :, :pT].float() - prefix_latent.float()).abs()
         latent_meta["prefix_T"] = pT
         latent_meta["frozen_prefix"] = bool(args.freeze_prefix_latent)
-        latent_meta["prefix_max_abs_diff"] = float(
-            (out["latent"][:, :, :pT].float() - prefix_latent.float()).abs().max().item()
-        )
+        latent_meta["prefix_hardmask_inpaint"] = bool(args.prefix_hardmask_inpaint)
+        latent_meta["prefix_max_abs_diff"] = float(prefix_diff.max().item())
+        latent_meta["prefix_mean_abs_diff"] = float(prefix_diff.mean().item())
         logger.info(
             f"[prefix] freeze check: max_abs_diff(prefix_in, cumulative_out[:{pT}]) = "
-            f"{latent_meta['prefix_max_abs_diff']:.3e}"
+            f"{latent_meta['prefix_max_abs_diff']:.3e}, mean = {latent_meta['prefix_mean_abs_diff']:.3e}"
         )
+        hardmask_debug = getattr(pipeline, "last_hardmask_debug", None)
+        if hardmask_debug is not None:
+            latent_meta["hardmask"] = hardmask_debug
     logger.info(
         f"[latent] kind={latent_meta['latent_kind']} shape={tuple(decode_latent.shape)} "
         f"dtype={decode_latent.dtype}"

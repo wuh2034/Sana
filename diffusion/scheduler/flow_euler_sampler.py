@@ -83,6 +83,132 @@ class FlowEuler:
         return latents
 
 
+class PrefixHardmaskLTXFlowEuler(FlowEuler):
+    """Temporal latent inpainting via sampling-time HARD MASK REPLACEMENT.
+
+    Implements the CompVis latent-diffusion inpainting scheme
+    (scripts/inpaint.py + DDIMSampler.p_sample_ddim:
+        img_orig = q_sample(x0, t); img = mask * img_orig + (1-mask) * img)
+    adapted to the flow-matching (rectified-flow) sampler SANA-WM actually uses.
+
+    Difference vs LTXFlowEuler's condition_frame_info path: that path keeps the
+    conditioning (prefix) frames CLEAN, gives them per-frame timestep 0 and never
+    steps them, so the model sees [clean prefix | noisy future] with a per-frame
+    timestep vector. Here instead, at EVERY denoising step the known prefix x0 is
+    forward-noised to the CURRENT noise level and hard-replaces the prefix region,
+    so the model sees the whole cumulative latent at ONE uniform noise level:
+
+        known_t = (1 - sigma_t) * x0_known + sigma_t * noise   # forward noising
+        x_t     = mask * known_t + (1 - mask) * x_t            # hard replacement
+        x_prev  = euler_step(x_t, t)                           # uniform timestep
+
+    Noise schedule: diffusers FlowMatchEulerDiscreteScheduler (the scheduler this
+    project's FlowEuler/LTXFlowEuler already use). Its forward process is
+    ``scale_noise``: x_t = sigma * noise + (1 - sigma) * x0, with
+    sigma_i = timesteps[i] / num_train_timesteps (= scheduler.sigmas[i], flow_shift
+    already folded in by set_timesteps). This is the flow-matching interpolation,
+    NOT the DDPM sqrt(alpha_bar)*x0 + sqrt(1-alpha_bar)*noise form.
+
+    ``fixed_noise=True`` (default) draws ONE noise sample for the prefix and reuses
+    it every step: in rectified flow, (1-sigma)*x0 + sigma*eps with a fixed eps is
+    exactly the straight-line conditional path the ODE integrates, so the prefix
+    follows a valid sampling trajectory. ``fixed_noise=False`` redraws noise each
+    step, matching LDM's q_sample behaviour literally.
+    """
+
+    def __init__(self, model_fn, condition, uncondition, cfg_scale, flow_shift=3.0, model_kwargs=None):
+        super().__init__(model_fn, condition, uncondition, cfg_scale, flow_shift, model_kwargs)
+
+    def sample(self, latents, steps=28, generator=None, x0_known=None, prefix_mask=None, fixed_noise=True):
+        """
+        latents:     1,C,F,H,W  — pure noise for the WHOLE cumulative latent.
+        x0_known:    1,C,F,H,W  — clean prefix latent in [:, :, :T_prefix]; rest unused.
+        prefix_mask: 1,1,F,1,1  — 1.0 on prefix frames, 0.0 on frames to generate.
+        """
+        if x0_known is None or prefix_mask is None:
+            raise ValueError("PrefixHardmaskLTXFlowEuler requires x0_known and prefix_mask.")
+
+        device = self.condition.device
+        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, steps, device, None)
+        do_classifier_free_guidance = self.cfg_scale > 1
+
+        # This sampler intentionally uses NO clean conditioning frames: the anchor
+        # frame 0 lies inside the hardmask prefix and is enforced by replacement.
+        self.model_kwargs["data_info"].pop("condition_frame_info", None)
+
+        prompt_embeds = self.condition
+        if do_classifier_free_guidance:
+            prompt_embeds = torch.cat([self.uncondition, self.condition], dim=0)
+
+        x0_known = x0_known.to(device=latents.device, dtype=latents.dtype)
+        prefix_mask = prefix_mask.to(device=latents.device, dtype=latents.dtype)
+        keep_known = prefix_mask.bool()
+
+        prefix_noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+
+        for i, t in tqdm(list(enumerate(timesteps)), disable=os.getenv("DPM_TQDM", "False") == "True"):
+            # sigma_t of the CURRENT step. retrieve_timesteps builds
+            # timesteps = sigmas * num_train_timesteps (1000), so t/1000 == sigmas[i].
+            sigma_t = (t / self.scheduler.config.num_train_timesteps).to(latents.dtype)
+
+            # 1) forward-noise the known prefix to the current noise level
+            #    (FlowMatchEulerDiscreteScheduler.scale_noise formula).
+            noise = prefix_noise if fixed_noise else randn_tensor(
+                latents.shape, generator=generator, device=latents.device, dtype=latents.dtype
+            )
+            known_t = (1.0 - sigma_t) * x0_known + sigma_t * noise
+
+            # 2) hard mask replacement: prefix region <- known_t, rest untouched.
+            latents = torch.where(keep_known, known_t, latents)
+
+            # 3) one denoising step at a UNIFORM timestep for ALL frames (the model
+            #    sees the full cumulative latent at one noise level).
+            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            b = latent_model_input.shape[0]
+            num_frames = latents.shape[2]
+            timestep = t.expand(b, 1, num_frames).float()  # b,1,f — same API as LTXFlowEuler
+
+            noise_pred = self.model(
+                latent_model_input,
+                timestep,
+                prompt_embeds,
+                **self.model_kwargs,
+            )
+
+            if isinstance(noise_pred, Transformer2DModelOutput):
+                noise_pred = noise_pred[0]
+
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + self.cfg_scale * (noise_pred_text - noise_pred_uncond)
+                timestep = timestep.chunk(2)[0]
+
+            latents_dtype = latents.dtype
+            latents_shape = latents.shape
+            batch_size, num_latent_channels, num_frames, height, width = latents_shape
+
+            # Same per-token Euler update as LTXFlowEuler (with uniform timesteps this
+            # equals the scalar update x_prev = x_t + (sigma_next - sigma_t) * v).
+            # per_token_timesteps wants one timestep per token (b, F*H*W); tokens are
+            # F-major after reshape(b,C,-1).transpose(1,2), so repeat each frame's t H*W times.
+            per_token_t = timestep.reshape(batch_size, 1, num_frames)[:, 0].repeat_interleave(height * width, dim=-1)
+            denoised_latents = self.scheduler.step(
+                -noise_pred.reshape(batch_size, num_latent_channels, -1).transpose(1, 2),
+                t,
+                latents.reshape(batch_size, num_latent_channels, -1).transpose(1, 2),
+                per_token_timesteps=per_token_t,
+                return_dict=False,
+            )[0]
+            latents = denoised_latents.transpose(1, 2).reshape(latents_shape)
+
+            if latents.dtype != latents_dtype:
+                latents = latents.to(latents_dtype)
+
+        # Final enforcement: prefix region == clean known latent EXACTLY.
+        latents = torch.where(keep_known, x0_known, latents)
+        return latents
+
+
 class LTXFlowEuler(FlowEuler):
     def __init__(self, model_fn, condition, uncondition, cfg_scale, flow_shift=3.0, model_kwargs=None):
         super().__init__(model_fn, condition, uncondition, cfg_scale, flow_shift, model_kwargs)
