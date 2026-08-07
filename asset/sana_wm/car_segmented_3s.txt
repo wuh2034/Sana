@@ -1,0 +1,20 @@
+SCENE ANCHOR:
+A first-person low-floor view inside the same cluttered, sunlit toy room. A miniature red race car remains on the cracked wooden plank path, surrounded by scattered glass marbles, colorful blocks, buttons, books, small toy pieces, table legs, dusty furniture, peeling wall paint, and warm bands of afternoon sunlight through the window blinds. Keep the same realistic cinematic toy-room style, the same red race car identity, the same wooden floor texture, and the same nostalgic warm lighting. Do not add text, logos, subtitles, extra cars, or new characters.
+
+CAMERA AND ACTION CONTEXT:
+The camera follows the provided SANA-WM action trajectory: first a slow forward move, then a gentle forward-left drift, then forward movement again, and finally a still hold. The video should remain physically coherent and temporally smooth. This test is not about collision interaction; nearby marbles and toy objects may wobble slightly but should not teleport, disappear, melt, or suddenly change identity.
+
+TIMED STORYBOARD:
+[00.0-03.0s] Slow forward start along the cracked wooden plank path. The red race car stays visually stable in the foreground/midground, with warm sunlight bands and tiny dust motes visible in the room.
+
+[03.0-06.0s] Continue moving forward toward the scattered marbles and small toy pieces. The transparent blue ball and nearby marbles become slightly closer, but there is no intentional collision. The wooden floor texture flows smoothly under the camera.
+
+[06.0-09.0s] The motion shifts into a gentle forward-left drift matching the jw action. Table legs and blocks show mild side parallax. The red race car keeps its shape and identity; the room layout remains consistent.
+
+[09.0-12.0s] The camera finishes the side drift and returns to a steadier forward view. Blocks, books, buttons, and glass marbles remain in their original positions with only subtle natural wobble.
+
+[12.0-15.0s] Continue forward along the plank path. The scene should stay coherent: no sudden zoom, no object teleportation, no car deformation, no scene replacement.
+
+[15.0-18.0s] The camera slows into a still hold. The red race car and surrounding toys remain stable. Dust motes move gently in the sunlight and small marbles may shimmer faintly.
+
+[18.0-20.0s] Final quiet hold inside the same toy room. Warm sunlight, wooden floor cracks, table legs, marbles, books, and blocks remain stable. End with a calm, consistent room view.

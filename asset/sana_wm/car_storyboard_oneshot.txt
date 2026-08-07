@@ -1,0 +1,12 @@
+Cinematic photorealistic style, warm afternoon sunlight, the same cluttered toy room throughout. Keep the subject consistent; do not add any text, subtitles, logos, extra cars, or new characters.
+Atmosphere: nostalgic, warm, dusty sunbeams, gentle and quiet.
+Subject: a miniature red race car; keep its shape, color and identity consistent for the whole clip.
+Scene: a sunlit cluttered toy room, a cracked wooden plank path, scattered glass marbles, colorful blocks, buttons, books, small toy pieces, looming table legs, dusty furniture, peeling wall paint, slatted afternoon light through window blinds.
+Storyboard:
+[00-03s] Wide low-angle shot: the red race car slowly starts moving forward along the cracked wooden plank path, warm sunlight bands and tiny dust motes visible.
+[03-06s] Forward tracking shot: the camera keeps moving forward toward the scattered marbles and a transparent blue ball, the wooden floor texture flowing smoothly beneath.
+[06-09s] Medium drifting shot: the motion shifts into a gentle forward-left drift, table legs and blocks show mild side parallax, the red race car keeps its shape and identity.
+[09-12s] Medium shot: the camera finishes the side drift and returns to a steady forward view, blocks, books, buttons and marbles stay in place with only subtle natural wobble.
+[12-15s] Forward shot: continue forward along the plank path, the scene stays coherent, no sudden zoom, no teleporting objects, no car deformation, no scene replacement.
+[15-18s] Slow-down shot: the camera slows into a still hold, the red race car and surrounding toys remain stable, dust motes drift gently in the sunlight.
+[18-20s] Closing static shot: a quiet final hold in the same toy room, warm sunlight, wooden floor cracks, table legs, marbles, books and blocks all stable, ending on a calm consistent room view.

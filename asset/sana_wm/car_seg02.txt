@@ -1,0 +1,5 @@
+SCENE ANCHOR:
+A first-person low-floor view inside the same cluttered, sunlit toy room. A miniature red race car remains on the cracked wooden plank path, surrounded by scattered glass marbles, colorful blocks, buttons, books, small toy pieces, table legs, dusty furniture, peeling wall paint, and warm bands of afternoon sunlight through the window blinds. Keep the same realistic cinematic toy-room style, the same red race car identity, the same wooden floor texture, and the same nostalgic warm lighting. Do not add text, logos, subtitles, extra cars, or new characters.
+
+LOCAL ACTION (6-9s):
+The motion shifts into a gentle forward-left drift matching the jw action. Table legs and blocks show mild side parallax. The red race car keeps its shape and identity; the room layout remains consistent.

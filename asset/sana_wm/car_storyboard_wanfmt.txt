@@ -1,0 +1,13 @@
+Cinematic photorealistic style, a nostalgic sunlit cluttered toy room, keep the subject and scene consistent throughout, do not add any text, subtitles, logos, extra cars or new characters.
+Atmosphere: nostalgic, warm and slightly mysterious; slatted afternoon sunlight in warm bands, dust motes drifting through the sunbeams, glassy marble reflections and soft fabric shadows.
+Subject: a miniature red race car on a cracked wooden plank path; keep its shape, color and identity consistent for the entire clip.
+Scene: a first-person low view over a worn wooden floor inside a cluttered sunlit room; scattered marbles, colorful blocks, buttons, books and small toy pieces; looming table legs overhead; splintered floorboards, peeling wall paint, dusty furniture; slatted afternoon sunlight streaming through the window blinds.
+Storyboard:
+[00-03s] Wide shot: the red race car slowly starts moving forward along the cracked plank path, warm sunlight bands and tiny dust motes visible.
+[03-05.5s] Medium shot: the car keeps rolling straight forward toward the scattered marbles, the wooden floor texture flowing smoothly beneath.
+[05.5-08s] Tracking medium shot: the motion shifts into a gentle forward-left drift, table legs and blocks sweep past with mild side parallax.
+[08-10s] Medium shot: the forward-left drift continues, the red race car keeps its shape and identity while the room layout stays consistent.
+[10-12.5s] Tracking shot: the camera returns to a straight forward push, blocks, books, buttons and marbles stay in place with only subtle natural wobble.
+[12.5-15s] Wide shot: continue forward along the plank path toward the sunlit window, the scene stays coherent with no sudden zoom, no teleporting objects, no car deformation, no scene replacement.
+[15-17.5s] Slow-down shot: the camera decelerates into a still hold, the red race car and surrounding toys become stable, dust motes drifting gently in the sunlight.
+[17.5-20s] Closing static shot: a quiet final hold in the same toy room, warm sunlight, wooden floor cracks, table legs, marbles, books and blocks all stable, ending on a calm consistent room view.
